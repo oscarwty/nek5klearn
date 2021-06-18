@@ -1,0 +1,113 @@
+总流程：
+前处理：手写box，genbox生成rea画网格，，可选转re2，最后分配处理器genmap，mesh部分完成
+中处理：准备好SIZE、usr和par，makenek编译形成可执行.f，nekbmpi实际并行计算
+后处理：visnek形成*.nek5000索引各种.f00，此时彻底完成项目，visit -o *.nek5000最终看图
+
+需要的工具：make装好，gcc和gfortran，mpi自己编译（mpich和openmpi均可）
+把bin和tools加到路径.bashrc里面，maketools all自己编译所有工具，包括pretex等，看log缺什么
+
+bc格式：以二维为例，四行一个格子
+CBC IEL IEDGE CONN-IEL CONN-IEDGE redundant
+第一个是边界条件的类型，字母，有表
+第二个是“第几个格子”，从左下开始，向右123456第一行，然后上移一行，再789向右
+第三个是“格子的第几条边”，三维有图，二维是下右上左，逆时针一圈
+后面的都是3d，2d情况下=0
+
+usrdat2变形之后，边界条件usrbc和初始条件usric，里面的xy都必须是变形之后的，得根据形状重新写。
+但是只要出了.usr，比如nekmerge和pretex，都是变形前方块网格。要弄清楚编译顺序，这些工具都是改rea。
+rea和re2互转，全部都不需要加扩展名（除了genbox输入），默认re2要带一个rea文件规定mesh之外的信息。
+但是这个rea只需要满足维度2or3即可，里面的mesh，bc，par，实际上都会被丢弃。
+genbox的第一行是引用rea，第二行如果是2，那么生成一个rea，如果是-2，那么直接re2
+无论如何，re2必须带一个rea，否则之后genmap也失败，生成re2就自己改，推荐最后一步再re2，nekmerge要用rea
+
+genmap只根据mesh，所以改了usr、par、size参数不用重新genmap。map/ma2文件也只是rea/re2的扩展分配，不涉及参数
+makenek是最终编译步骤，nekbmpi就开始根据makenek生成的.f计算了，所以每次改了任何东西都要重新生成
+nekbmpi报错，多半是usr和par之类的参数输入有问题，logfile，分解好流程步骤，看是哪一步的问题回溯
+makenek报错，多半是rea已经不对劲了，要重新检查网格是否有矛盾
+
+It is not clear what NELGT in the definition of LELT at this link is (it is not defined anywhere on the site).
+Maximum number of local elements for T-mesh (>= int(NELGT/NP) + 1)
+NELGT is the actual total number of elements where LELG is an upper limit for NELGT.
+So if:
+LELT >= int(LELG/NP) + 1
+You cannot declare space with nelv, as it is a run-time parameter not known at link time.
+You must use lelv.
+
+lelv = upper bound on number of elements per processor.
+nelv = number of elements on this processor (when the code is executing)
+nelv = number of elements in the mesh (for purposes of .rea file).【没错，就两个nelv，看下一行】
+If number of processors (mpi ranks) = 1, then nelv in the two preceding definitions are the same.
+nelgv = total number of elements in the (non-neknek) simulation -- i.e., nelgv is equal to the nelv value in the .rea file.
+lelx, lely, lelz are parameters, defined at compile time, that are _sometimes_ (but more and more rarely) used to aid in data post-processing when your domain is coming as a monolithic tensor-product-box from genbox. lelx,lely,lelz are never needed for simulations.
+
+ifield=1 --> fluid
+2 --> thermal (temperature)
+3 --> passive scalar 1
+4 --> ps 2 , etc.
+
+if (ifield.eq.1) then
+   udiff  = a * exp(-b*temp) ! dynamic viscosity
+   utrans = 1.0              ! density
+else if (ifield.eq.2) then
+   udiff  = 1.0              ! conductivity
+   utrans = 1.0              ! rho*cp
+endif
+
+整体，udiff=扩散，utrans=内涵
+速度场，udiff=动力粘度µ，utrans=密度ρ
+能量场，udiff=热导率k，utrans=热容ρcp
+
+PPLIST="CVODE" 
+export PPLIST
+makenek mv_cyl
+
+如果makenek出现下面的提示，说明内存不够。
+additional relocation overflows omitted from the output
+一方面要降低lelt，可以多加lpmin把lelg多分开
+另一方面，建议直接把下面的东西加到bin/makenek脚本里，一劳永逸
+# optional compiler flags
+FFLAGS+="-mcmodel=medium"
+CFLAGS+="-mcmodel=medium"
+# optional linking flags
+USR_LFLAGS+="-mcmodel=medium"
+修改之后，记得先makenek clean。
+不用写intel相关，另外medium和large应该都可以
+
+超算：
+整个步骤基本相同，只是执行nek需要用提交任务，不能直行
+上下传文件，快传可以，winscp可能更好，
+查看硬盘空间，默认10T：
+lfs quota -uh sc51544 ~
+大部分编译都直接运行，tar可以不写v免得刷屏被管理员gank
+执行任务需要，节点尽量跑满64
+提交任务：（还是得在sh批处理里面写）
+sbatch -p amd_256 f2.sh
+sh如何编写：
+可以不用srun，我现在为了保护SESSION暂时默认nek
+要用前台的nekmpi，因为不要多重输出，前台可被记录
+输出用sbatch自带的slurm-666.out，一样可以tail
+手动把nekmpi里面的mpiexec改成mpirun，自己调用
+同时运行目标可能也要改一下./nek5000看情况
+记得要chmod +x，复制过去也不一定带权限
+并且为了分配多节点，sh中需要SBATCH来指定参数
+一个例子：sh文件，指定8核，因此是512进程
+#!/bin/bash
+#SBATCH -N 8
+#SBATCH -n 512
+./nekmpi flo 512
+查询提交情况：只查看自己账户，比单独squeue性能好
+squeue -u sc51544
+多看几次，如果秒没就是失败了，去看slurm.out吧
+查询任务具体情况，比如用了多少核之类的，可以忽略
+scontrol show job 666
+发现不对要赶快取消
+scancel 666
+
+取消A区public3上的module环境，登陆时不会自动加载
+source /public3/soft/modules/module.sh 
+所有第三方库都需要加载，应该是关闭ssh就失效
+gcc不需要（4.8.5），mpi需要，但是一般加载好了
+先查看一下module list，没有的再去找
+不要直接module avail，列表太长了会卡死
+可以后面加查询，比如module avail gcc
+
